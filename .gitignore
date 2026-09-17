@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Old puppeteer / whatsapp-web.js auth session folders
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Environment variables & secrets
+.env
+
+# Build outputs
+dist/
+
+# Local data / runtime files
+tasks.json
+last_active.json
+*.log
