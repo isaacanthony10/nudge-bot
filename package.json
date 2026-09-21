@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "description": "WhatsApp Task Assistant Bot",
   "main": "dist/server.js",
-  "scripts": {
-    "dev": "tsc && node dist/server.js"
+ "scripts": {
+    "build": "tsc",
+    "start": "node dist/webhook.js",
+    "dev": "ts-node src/webhook.ts"
   },
   "keywords": [],
   "author": "",
