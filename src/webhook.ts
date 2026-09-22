@@ -27,27 +27,45 @@ export interface Task {
   recurring?: 'daily' | 'weekly' | 'monthly' | null;
 }
 
+export interface UserProfile {
+  name?: string;
+  hasBeenWelcomed?: boolean;
+  tasks: Task[];
+}
+
 // --- Data Persistence Helpers ---
-function loadTasks(): Record<string, Task[]> {
+function loadDatabase(): Record<string, UserProfile> {
   try {
     if (fs.existsSync(TASKS_FILE)) {
-      return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'));
+      const rawData = fs.readFileSync(TASKS_FILE, 'utf-8');
+      const parsed = JSON.parse(rawData);
+
+      // Migrates old legacy schema (Record<string, Task[]>) to UserProfile if needed
+      const migrated: Record<string, UserProfile> = {};
+      for (const key in parsed) {
+        if (Array.isArray(parsed[key])) {
+          migrated[key] = { name: 'there', hasBeenWelcomed: false, tasks: parsed[key] };
+        } else {
+          migrated[key] = parsed[key];
+        }
+      }
+      return migrated;
     }
   } catch (error) {
-    console.error('Error loading tasks:', error);
+    console.error('Error loading tasks database:', error);
   }
   return {};
 }
 
-function saveTasks(tasks: Record<string, Task[]>) {
+function saveDatabase(db: Record<string, UserProfile>) {
   try {
-    fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2), 'utf-8');
+    fs.writeFileSync(TASKS_FILE, JSON.stringify(db, null, 2), 'utf-8');
   } catch (error) {
-    console.error('Error saving tasks:', error);
+    console.error('Error saving tasks database:', error);
   }
 }
 
-const tasksDB: Record<string, Task[]> = loadTasks();
+const db: Record<string, UserProfile> = loadDatabase();
 const pendingMoveSession: Record<string, number> = {};
 
 // --- Timezone Helper Functions ---
@@ -369,10 +387,25 @@ app.post('/webhook', async (req, res) => {
 
   const sender = message.from;
 
-  if (!tasksDB[sender]) {
-    tasksDB[sender] = [];
+  // Extract WhatsApp Profile Name
+  const contact = value?.contacts?.[0];
+  const rawName = contact?.profile?.name || '';
+  const firstName = rawName.trim() ? rawName.trim().split(' ')[0] : 'there';
+
+  // Initialize profile record if new
+  if (!db[sender]) {
+    db[sender] = {
+      name: firstName,
+      hasBeenWelcomed: false,
+      tasks: []
+    };
+    saveDatabase(db);
+  } else if (rawName && db[sender].name !== firstName) {
+    db[sender].name = firstName;
+    saveDatabase(db);
   }
-  const userTasks = tasksDB[sender];
+
+  const userTasks = db[sender].tasks;
 
   // Helper function to send full help menu
   const sendHelpMenu = async (to: string) => {
@@ -393,6 +426,37 @@ app.post('/webhook', async (req, res) => {
       "💬 No complicated commands. Just talk to me naturally.";
     await sendWhatsAppMessage(to, menuMsg);
   };
+
+  // Helper function for onboarding welcome card
+  const sendOnboardingCard = async (to: string, name: string) => {
+    const welcomeText = 
+      `👋 *Hi ${name}! Welcome to Nudge.*\n\n` +
+      `I'm your personal task assistant. I can help you stay on top of your reminders and daily to-dos!\n\n` +
+      `*Here’s what you can do:*\n` +
+      `🎙️ *Voice Notes:* Send a voice note like _"Remind me to call John at 5pm today"_.\n\n` +
+      `✍️ *Text Commands:*\n` +
+      `• _"Remind me to call John at 4pm"_\n` +
+      `• _"Add review streetwear mockups"_\n` +
+      `• _"Remind me every Monday to submit my report"_\n\n` +
+      `What would you like to set a reminder for today?`;
+
+    await sendWhatsAppButtons(
+      to,
+      welcomeText,
+      [
+        { id: 'btn_go_to_menu', title: '📋 Go To Menu' }
+      ]
+    );
+
+    db[to].hasBeenWelcomed = true;
+    saveDatabase(db);
+  };
+
+  // Trigger Onboarding for First-Time Users automatically
+  if (!db[sender].hasBeenWelcomed) {
+    await sendOnboardingCard(sender, firstName);
+    return;
+  }
 
   // --- Handle Interactive Selection Clicks (Buttons & Lists) ---
   if (message.type === 'interactive') {
@@ -470,7 +534,7 @@ app.post('/webhook', async (req, res) => {
       const index = userTasks.findIndex(t => t.id === taskId);
       if (index !== -1) {
         const removed = userTasks.splice(index, 1);
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `🎉 Task completed: "${cleanTaskTitle(removed[0].text)}"! It has been removed from your list.`);
       } else {
         await sendWhatsAppMessage(sender, "❌ Task not found or already completed!");
@@ -497,7 +561,7 @@ app.post('/webhook', async (req, res) => {
       const index = userTasks.findIndex(t => t.id === taskId);
       if (index !== -1) {
         const removed = userTasks.splice(index, 1);
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `🗑️ Deleted successfully: "${cleanTaskTitle(removed[0].text)}"`);
       } else {
         await sendWhatsAppMessage(sender, "❌ Task not found or already deleted!");
@@ -507,8 +571,8 @@ app.post('/webhook', async (req, res) => {
 
     // 4. Clear All Confirmation Handlers
     if (selectedId === 'btn_confirm_clear') {
-      tasksDB[sender] = [];
-      saveTasks(tasksDB);
+      db[sender].tasks = [];
+      saveDatabase(db);
       await sendWhatsAppMessage(sender, "🧹 All your tasks have been cleared successfully!");
       return;
     }
@@ -526,7 +590,7 @@ app.post('/webhook', async (req, res) => {
         const nowStr = formatDate(new Date());
         task.dueDate = addMinutesToDueDate(nowStr, 15);
         task.reminded = false;
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `⏱️ Snoozed "${cleanTaskTitle(task.text)}" for 15 minutes! (${formatFriendlyTime(task.dueDate, true)})`);
       }
       return;
@@ -539,7 +603,7 @@ app.post('/webhook', async (req, res) => {
         const nowStr = formatDate(new Date());
         task.dueDate = addMinutesToDueDate(nowStr, 60);
         task.reminded = false;
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `⏰ Snoozed "${cleanTaskTitle(task.text)}" for 1 hour! (${formatFriendlyTime(task.dueDate, true)})`);
       }
       return;
@@ -555,7 +619,7 @@ app.post('/webhook', async (req, res) => {
         const currentTime = task.dueDate ? task.dueDate.split(' ')[1] : '09:00';
         task.dueDate = `${tomorrowStr} ${currentTime}`;
         task.reminded = false;
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `🚀 Snoozed "${cleanTaskTitle(task.text)}" to tomorrow! (${formatFriendlyTime(task.dueDate, true)})`);
       }
       return;
@@ -628,7 +692,7 @@ app.post('/webhook', async (req, res) => {
       if (parsed.dueDate) {
         task.dueDate = parsed.dueDate;
         task.reminded = false;
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `✏️ Task successfully moved! "${cleanTaskTitle(task.text)}" is now scheduled for: *${formatFriendlyTime(task.dueDate, true)}*`);
       } else {
         await sendWhatsAppMessage(sender, `❌ Could not parse date/time from "${trimText}". Please try moving again.`);
@@ -646,15 +710,15 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    const totalUsers = Object.keys(tasksDB).length;
+    const totalUsers = Object.keys(db).length;
     
     let totalActiveTasks = 0;
     let totalOverdueTasks = 0;
     const nowStr = formatDate(new Date());
 
-    Object.values(tasksDB).forEach(uTasks => {
-      totalActiveTasks += uTasks.length;
-      totalOverdueTasks += uTasks.filter(t => t.dueDate && t.dueDate < nowStr).length;
+    Object.values(db).forEach(user => {
+      totalActiveTasks += user.tasks.length;
+      totalOverdueTasks += user.tasks.filter(t => t.dueDate && t.dueDate < nowStr).length;
     });
 
     const statsMsg = 
@@ -681,24 +745,7 @@ app.post('/webhook', async (req, res) => {
   // 1. Initial Greeting / Welcome Triggers
   const welcomeTriggers = ['hi', 'hi nudge', 'hey', 'hey nudge', 'hello', 'hello nudge', 'yo nudge'];
   if (welcomeTriggers.includes(cleanLowerText)) {
-    const welcomeMsg = 
-      "👋 Hey! I’m Nudge.\n" +
-      "Your personal reminder buddy. 🫶\n" +
-      "Just tell me what you need to remember and when you need it.\n\n" +
-      "Try saying:\n" +
-      "• “Remind me to call John at 4pm”\n" +
-      "• “Add review streetwear mockups”\n" +
-      "• “Remind me every Monday to submit my report”\n\n" +
-      "🎙️ You can also send me a voice note.\n" +
-      "That’s it — I’ll handle the rest.";
-    
-    await sendWhatsAppButtons(
-      sender,
-      welcomeMsg,
-      [
-        { id: 'btn_go_to_menu', title: '📋 Go To Menu' }
-      ]
-    );
+    await sendOnboardingCard(sender, firstName);
     return;
   }
 
@@ -744,7 +791,7 @@ app.post('/webhook', async (req, res) => {
     if (!query || cleanLowerText === 'done' || ['completed tasks', 'completed task', 'completed'].includes(cleanLowerText)) {
       if (userTasks.length === 1) {
         const removed = userTasks.splice(0, 1);
-        saveTasks(tasksDB);
+        saveDatabase(db);
         await sendWhatsAppMessage(sender, `🎉 Task completed: "${cleanTaskTitle(removed[0].text)}"!`);
         return;
       }
@@ -762,7 +809,7 @@ app.post('/webhook', async (req, res) => {
     const index = parseInt(query) - 1;
     if (!isNaN(index) && index >= 0 && index < userTasks.length) {
       const removed = userTasks.splice(index, 1);
-      saveTasks(tasksDB);
+      saveDatabase(db);
       await sendWhatsAppMessage(sender, `🎉 Task completed: "${cleanTaskTitle(removed[0].text)}"!`);
       return;
     }
@@ -770,7 +817,7 @@ app.post('/webhook', async (req, res) => {
     const foundIdx = userTasks.findIndex(t => t.text.toLowerCase().includes(query.toLowerCase()));
     if (foundIdx !== -1) {
       const removed = userTasks.splice(foundIdx, 1);
-      saveTasks(tasksDB);
+      saveDatabase(db);
       await sendWhatsAppMessage(sender, `🎉 Task completed: "${cleanTaskTitle(removed[0].text)}"!`);
       return;
     }
@@ -828,7 +875,7 @@ app.post('/webhook', async (req, res) => {
         const idsToDelete: number[] = indices.map((idx: number): number => sortedTasks[idx].id);
         const removedTitles: string[] = [];
 
-        tasksDB[sender] = userTasks.filter((t: Task) => {
+        db[sender].tasks = userTasks.filter((t: Task) => {
           if (idsToDelete.includes(t.id)) {
             removedTitles.push(cleanTaskTitle(t.text));
             return false;
@@ -836,7 +883,7 @@ app.post('/webhook', async (req, res) => {
           return true;
         });
 
-        saveTasks(tasksDB);
+        saveDatabase(db);
 
         if (removedTitles.length === 1) {
           await sendWhatsAppMessage(sender, `🗑️ Deleted successfully: "${removedTitles[0]}"`);
@@ -964,7 +1011,7 @@ app.post('/webhook', async (req, res) => {
     };
 
     userTasks.push(newTask);
-    saveTasks(tasksDB);
+    saveDatabase(db);
 
     const timeMsg = parsed.dueDate ? `\n⏰ Reminder set for: *${formatFriendlyTime(parsed.dueDate, true)}*` : '';
     const recMsg = parsed.recurring ? `\n🔄 Repeats: *${parsed.recurring}*` : '';
@@ -972,7 +1019,7 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // Fallback for unrecognized commands or misheard voice notes (e.g. "my process")
+  // Fallback for unrecognized commands or misheard voice notes
   await sendWhatsAppButtons(
     sender,
     `❌ Unrecognized command: *"${trimText}"*\n\nDid you mean to view your tasks, or create a new reminder?`,
@@ -987,8 +1034,8 @@ cron.schedule('* * * * *', async () => {
   const now = new Date();
   const formattedNow = formatDate(now);
 
-  for (const sender in tasksDB) {
-    for (const task of tasksDB[sender]) {
+  for (const sender in db) {
+    for (const task of db[sender].tasks) {
       if (task.dueDate && task.dueDate <= formattedNow && !task.reminded) {
         try {
           const recurringNote = task.recurring ? ` _(Recurring: ${task.recurring})_` : '';
@@ -1011,7 +1058,7 @@ cron.schedule('* * * * *', async () => {
             task.reminded = true;
           }
 
-          saveTasks(tasksDB);
+          saveDatabase(db);
         } catch (err) {
           console.error('Error sending scheduled reminder:', err);
         }
